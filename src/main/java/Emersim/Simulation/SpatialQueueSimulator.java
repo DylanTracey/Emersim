@@ -1,0 +1,236 @@
+/**
+ * Based on the standard Jmarkov SpatialQueueSimulator
+ */
+
+package Emersim.Simulation;
+
+
+import com.teamdev.jxmaps.LatLng;
+import Emersim.Gui.GuiComponents;
+import Emersim.Gui.QueueDrawer;
+import Emersim.Gui.Statistics;
+import Emersim.Map.MapConfig;
+import Emersim.Gui.ProgressBar;
+import Emersim.Utils.Location;
+
+import java.util.Date;
+import java.util.LinkedList;
+import java.util.Random;
+
+public class SpatialQueueSimulator implements Runnable {
+
+    // Server is the server that deals with requests.
+    // All logic related to dealing with requests is delegated to it
+    private Server server;
+
+    private LinkedList<ClientRegion> clientRegions;
+
+    //current simulation time
+    private double currentTime;// in milliseconds
+
+    //it saves the data if the simulator is paused or not
+    private boolean paused = false;
+
+    //multiplier is used for multiplier for timer.(comes from simulation time slide bar)
+    private double timeMultiplier = 1.0;
+
+    private boolean running = false;
+
+    private int currentRequestID;
+
+    private int maxRequests;
+
+    private int priorityLevels;
+
+    private GuiComponents.QUEUE_MODE queueMode;
+
+    private QueueDrawer queueDrawer;
+
+    private MapConfig mapConfig;
+
+    private boolean returnJourney;
+
+    private Statistics stats;
+
+    private ProgressBar progressBar;
+
+    public SpatialQueueSimulator(double timeMultiplier, Server server, int maxRequests, int priorityLevels, GuiComponents.QUEUE_MODE queueMode) {
+
+        super();
+        currentTime = 0;
+        setTimeMultiplier(timeMultiplier);
+        this.server = server;
+        this.mapConfig = GuiComponents.getMapConfig();
+        this.clientRegions = mapConfig.getClientRegions();
+        this.currentRequestID = 0;
+        this.maxRequests = maxRequests;
+        this.priorityLevels = priorityLevels;
+        this.queueMode = queueMode;
+
+        this.returnJourney = GuiComponents.isReturnJourney();
+        // lambda is #(number of requests per second)
+
+        float maxInterval = 3;
+        this.stats = GuiComponents.getStats();
+        this.queueDrawer = stats.getQueueDrawer();
+
+        double totalLambda = 0;
+        //Create a new request generator for each client region
+        for (ClientRegion cr : clientRegions) {
+            RequestGenerator rg = new RequestGenerator(this, cr.getLambda(), cr);
+            cr.setRequestGenerator(rg);
+            totalLambda += cr.getLambda();
+        }
+
+        double systemLambda = totalLambda / clientRegions.size();
+        stats.setLambda(systemLambda);
+    }
+
+    private Client generateNewClientWithinArea(ClientRegion clientRegion) {
+        Location clientLocation = clientRegion.generatePoint();
+        return new Client(clientRegion, clientLocation, this.priorityLevels, queueMode);
+    }
+
+    public void run() {
+        running = true;
+        // this is the simulation time till run command is called (?)
+        double currentTimeMultiplied;
+        //when calling run getting the current real time (?)
+        long realTimeStart;
+        //this is the time after return the thread.sleep (?)
+        long realTimeCurrent;
+        currentTimeMultiplied = 0;
+        realTimeStart = new Date().getTime();
+
+        // For each client region, Start new thread and run the generator from it
+        for (ClientRegion cr : clientRegions) {
+            Thread generatorThread = new Thread(cr.getGenerator());
+            generatorThread.start();
+        }
+
+        // Start progress bar thread
+        progressBar = new ProgressBar(timeMultiplier);
+        Thread progressBarThread = new Thread(progressBar);
+        progressBarThread.start();
+
+        // While not paused, process requests or wait for another one to be added
+        while (!paused && moreRequests()) {
+            if (this.server.getQueue().size() > 0) {
+                // Serve the next request and grab a link to the request being served
+                Request currentRequest = this.server.serveRequest(currentTime);
+                // notify visualisation with which job is being served
+                queueDrawer.servingJob(currentRequest.getRequestId());
+                if (mapConfig.getTravelMethod() != MapConfig.TRAVEL_METHOD.AS_CROW_FLIES) {
+                    mapConfig.displayRoute(currentRequest.getDirectionsResult());
+                } else {
+                    LatLng serverLocation = server.getLocation().getLocationAsLatLng();
+                    LatLng clientLocation = currentRequest.getClient().getLocation().getLocationAsLatLng();
+                    mapConfig.displayCrowFliesRoute(serverLocation, clientLocation);
+                }
+                // notify progress bar and update the job time and time multiplier
+                progressBar.setJobLength(currentRequest.getResponseTime());
+                progressBar.setTimeMultiplier(timeMultiplier);
+                currentTimeMultiplied += (currentRequest.getNextEventTime() - currentTime) / timeMultiplier;
+                //this is calculating how long system will sleep
+                realTimeCurrent = new Date().getTime() - realTimeStart;
+
+                // If necessary, sleep
+                if ((long) currentTimeMultiplied > realTimeCurrent) {
+                    try {
+                        Thread.sleep((long) currentTimeMultiplied - realTimeCurrent);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                    realTimeCurrent = new Date().getTime() - realTimeStart;
+                }
+
+                stats.setSI(server.getAverageServiceTime());
+                System.out.println("Service time " + stats.getQueueLogic().getS());
+
+                //Having waited till the request has been served, deal with it
+                currentTime = currentRequest.getNextEventTime();
+                this.server.stopServing(currentTime);
+                // update queue visualisation
+                queueDrawer.exitQueue();
+
+            } else {
+                // No requests in queue, so just loop till another is added
+            }
+        }
+        running = false;
+        GuiComponents.stopProcessing();
+        System.out.println("Stopping, total requests served: " + this.server.getNumberOfRequestsServed());
+
+    }
+
+    // Return true iff server has served fewer then maxRequests requests or if maxRequests == 0
+    synchronized boolean moreRequests() {
+        return ((this.server.getNumberOfRequestsServed() < this.maxRequests) || maxRequests == 0);
+    }
+
+    private synchronized int getNextRequestID() {
+        int r = this.currentRequestID;
+        this.currentRequestID++;
+        return r;
+    }
+
+    public synchronized Request createRequest(ClientRegion cr) {
+        //Current implementation: create a new client then generate a request from them
+        //Future implementation could take existing client (generate before running sim)
+        int randomInt = new Random().nextInt(this.clientRegions.size());
+
+        Client client = this.generateNewClientWithinArea(cr);
+
+        return client.makeRequest(getNextRequestID(), this.currentTime);
+    }
+
+    public synchronized void enqueueRequest(Request newRequest) {
+        if (newRequest != null) {
+            this.server.handleRequest(newRequest, returnJourney);
+        }
+    }
+
+    public void pause() {
+        if (paused) {
+            paused = false;
+            start();
+        } else {
+            paused = true;
+        }
+    }
+
+    public void start() {
+        Thread simt = new Thread(this);
+        simt.setDaemon(true);
+        simt.start();
+    }
+
+    public void stop() {
+        this.paused = true;
+        progressBar.stop();
+    }
+
+    public double getTimeMultiplier() {
+        return this.timeMultiplier;
+    }
+
+    public void setTimeMultiplier(double timeMultiplier) {
+        this.timeMultiplier = timeMultiplier;
+    }
+
+    public boolean isRunning() {
+        return this.running;
+    }
+
+    public LinkedList<ClientRegion> getRegions() {
+        return clientRegions;
+    }
+
+    public QueueDrawer getQueueDrawer() {
+        return queueDrawer;
+    }
+
+    public double getAverageServiceTime() {
+        return server.getAverageServiceTime();
+    }
+}
